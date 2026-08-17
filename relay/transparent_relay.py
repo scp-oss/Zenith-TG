@@ -77,6 +77,22 @@ ws_blacklist: Set[str] = set()
 dc_fail_until: Dict[str, float] = {}
 ip_fail_until: Dict[str, float] = {}
 
+# Живой случай на NETH-4: браузер (или несколько устройств за одним
+# VLESS-туннелем -- отсюда всё видно как один и тот же клиентский IP,
+# не различить) открыл ~20 000 passthrough-соединений к
+# web.telegram.org МЕНЬШЕ ЧЕМ ЗА МИНУТУ -- похоже на цикл
+# переподключений без backoff, возможно раскрученный самой низкой
+# задержкой локального релея (обычный round-trip до Telegram занял бы
+# заметно дольше, чем локальный passthrough). Причину со стороны чужого
+# JS-клиента диагностировать нечем -- вместо этого защищаем сам релей:
+# жёсткий потолок одновременных passthrough-соединений (жди своей
+# очереди/новые лишние сразу закрываются) + таймаут на простаивающие
+# без данных. Не влияет на MTProto-путь (он использует пул tg-ws-proxy,
+# отдельный лимит там уже есть).
+PASSTHROUGH_MAX_CONCURRENT = 800
+PASSTHROUGH_IDLE_TIMEOUT = 90.0
+_passthrough_semaphore = asyncio.Semaphore(PASSTHROUGH_MAX_CONCURRENT)
+
 
 def _decode_direct_client_init(handshake: bytes):
     """Декодирует 64-байтный init КАК НАСТОЯЩИЙ прямой клиент -- ключ
@@ -144,55 +160,69 @@ async def _passthrough_plain_tcp(reader: asyncio.StreamReader, writer: asyncio.S
         return
 
     dst_ip, dst_port = dst
-    log.info("[%s] не MTProto -- прозрачный TCP passthrough к %s:%d "
-             "(настоящий адрес назначения до REDIRECT)", label, dst_ip, dst_port)
 
-    try:
-        up_reader, up_writer = await asyncio.wait_for(
-            asyncio.open_connection(dst_ip, dst_port), timeout=8)
-    except Exception as exc:
-        log.warning("[%s] passthrough к %s:%d не удался: %s", label, dst_ip, dst_port, exc)
+    # Потолок на ОБЩЕЕ число одновременных passthrough-соединений --
+    # см. комментарий у PASSTHROUGH_MAX_CONCURRENT выше. non-blocking
+    # acquire: если лимит уже выбран, не ставим в очередь (клиент и так
+    # в цикле переподключений -- очередь только продлит его), а сразу
+    # закрываем, чтобы клиент немедленно получил явный отказ вместо
+    # зависшего соединения.
+    if _passthrough_semaphore.locked():
+        log.warning("[%s] passthrough к %s:%d отклонён -- лимит одновременных "
+                    "соединений (%d) исчерпан", label, dst_ip, dst_port,
+                    PASSTHROUGH_MAX_CONCURRENT)
         return
 
-    try:
-        up_writer.write(already_read)
-        await up_writer.drain()
+    async with _passthrough_semaphore:
+        log.info("[%s] не MTProto -- прозрачный TCP passthrough к %s:%d "
+                 "(настоящий адрес назначения до REDIRECT)", label, dst_ip, dst_port)
 
-        async def _pipe(src, dst_w):
-            try:
-                while True:
-                    chunk = await src.read(65536)
-                    if not chunk:
-                        break
-                    dst_w.write(chunk)
-                    await dst_w.drain()
-            except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError, OSError):
-                pass
-
-        # asyncio.wait(FIRST_COMPLETED), не gather -- если ждать ОБЕ
-        # стороны до конца, полуоткрытое соединение (одна сторона молча
-        # перестала слать данные, не закрывая TCP) держит оба сокета
-        # открытыми НАВСЕГДА. Как только закрылась любая сторона --
-        # рвём вторую сами, не дожидаясь. Живой случай на NETH-4:
-        # web.telegram.org открывает десятки параллельных соединений,
-        # без этого они копились и упирались в лимит дескрипторов
-        # ("Too many open files").
-        up_task = asyncio.ensure_future(_pipe(reader, up_writer))
-        down_task = asyncio.ensure_future(_pipe(up_reader, writer))
         try:
-            await asyncio.wait(
-                {up_task, down_task}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for t in (up_task, down_task):
-                if not t.done():
-                    t.cancel()
-            await asyncio.gather(up_task, down_task, return_exceptions=True)
-    finally:
-        for w in (up_writer, writer):
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(dst_ip, dst_port), timeout=8)
+        except Exception as exc:
+            log.warning("[%s] passthrough к %s:%d не удался: %s", label, dst_ip, dst_port, exc)
+            return
+
+        try:
+            up_writer.write(already_read)
+            await up_writer.drain()
+
+            async def _pipe(src, dst_w):
+                try:
+                    while True:
+                        chunk = await asyncio.wait_for(
+                            src.read(65536), timeout=PASSTHROUGH_IDLE_TIMEOUT)
+                        if not chunk:
+                            break
+                        dst_w.write(chunk)
+                        await dst_w.drain()
+                except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError,
+                        OSError, asyncio.TimeoutError):
+                    pass
+
+            # asyncio.wait(FIRST_COMPLETED), не gather -- если ждать ОБЕ
+            # стороны до конца, полуоткрытое соединение (одна сторона
+            # молча перестала слать данные, не закрывая TCP) держит оба
+            # сокета открытыми НАВСЕГДА. Как только закрылась (или
+            # простояла PASSTHROUGH_IDLE_TIMEOUT без данных) любая
+            # сторона -- рвём вторую сами, не дожидаясь.
+            up_task = asyncio.ensure_future(_pipe(reader, up_writer))
+            down_task = asyncio.ensure_future(_pipe(up_reader, writer))
             try:
-                w.close()
-            except Exception:
-                pass
+                await asyncio.wait(
+                    {up_task, down_task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for t in (up_task, down_task):
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(up_task, down_task, return_exceptions=True)
+        finally:
+            for w in (up_writer, writer):
+                try:
+                    w.close()
+                except Exception:
+                    pass
 
 
 def _build_crypto_ctx_direct(client_dec_prekey_iv: bytes, relay_init: bytes) -> CryptoCtx:
