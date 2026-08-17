@@ -8,6 +8,12 @@ Type=simple
 User=tgrelay
 Group=tgrelay
 WorkingDirectory=/opt/Zenith-TG/relay
+# ZTG_CF_WORKER_HOST / ZTG_CF_WORKER_SECRET (опционально, см.
+# cf_worker/README.md) -- fallback через Cloudflare Worker для
+# passthrough-трафика (напр. web.telegram.org), когда прямой TCP с этой
+# машины заблокирован на уровне null-route. Файл может не существовать --
+# ведущий "-" делает EnvironmentFile необязательным, без ошибки старта.
+EnvironmentFile=-/etc/z2r_autobench/tgrelay.env
 ExecStart=/opt/Zenith-TG/.venv/bin/python -u transparent_relay.py --host 127.0.0.1 --port 8447
 Restart=on-failure
 RestartSec=5

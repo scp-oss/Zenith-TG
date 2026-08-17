@@ -1,0 +1,7 @@
+name = "zenith-tg-relay"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# RELAY_SECRET задаётся ПОСЛЕ первого деплоя через:
+#   wrangler secret put RELAY_SECRET
+# (не хранить секрет прямо тут в открытом виде -- см. README.md рядом)

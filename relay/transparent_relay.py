@@ -93,6 +93,24 @@ PASSTHROUGH_MAX_CONCURRENT = 800
 PASSTHROUGH_IDLE_TIMEOUT = 90.0
 _passthrough_semaphore = asyncio.Semaphore(PASSTHROUGH_MAX_CONCURRENT)
 
+# Живой случай на NETH-4: web.telegram.org (149.154.167.99) заблокирован
+# на границе сети целиком на уровне SYN (null-route) -- эмпирически
+# подтверждено (curl без REDIRECT: полный таймаут, тот же итог, что и у
+# самого релея при прямом подключении). Никакой --lua-desync=/сплит
+# ClientHello тут не поможет -- манглить нечего, пакет наружу не уходит.
+# Единственный найденный обходной путь: открыть TCP до настоящего IP
+# Telegram НЕ с самого NETH-4, а из сети Cloudflare (свой исходящий
+# маршрут, вероятно с ней у Telegram связность чистая) -- см.
+# cf_worker/worker.js, использует `cloudflare:sockets`. NETH-4 достаёт
+# до Worker обычным WebSocket через Cloudflare edge (не заблокирован --
+# домен *.workers.dev на облаке Cloudflare, тот же принцип, что и
+# cfproxy_worker_domains у оригинального tg-ws-proxy для MTProto-пути).
+# Опционально: если не настроено (пусто) -- поведение как раньше,
+# passthrough просто не удаётся и разрывается.
+CF_WORKER_HOST = os.environ.get('ZTG_CF_WORKER_HOST', '')
+CF_WORKER_SECRET = os.environ.get('ZTG_CF_WORKER_SECRET', '')
+CF_WORKER_TIMEOUT = 8.0
+
 
 def _decode_direct_client_init(handshake: bytes):
     """Декодирует 64-байтный init КАК НАСТОЯЩИЙ прямой клиент -- ключ
@@ -182,6 +200,20 @@ async def _passthrough_plain_tcp(reader: asyncio.StreamReader, writer: asyncio.S
                 asyncio.open_connection(dst_ip, dst_port), timeout=8)
         except Exception as exc:
             log.warning("[%s] passthrough к %s:%d не удался: %s", label, dst_ip, dst_port, exc)
+            ws = await _connect_via_cf_worker(dst_ip, dst_port, label)
+            if ws is None:
+                return
+            try:
+                await _relay_over_cf_worker(reader, writer, ws, already_read, label)
+            finally:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                try:
+                    writer.close()
+                except Exception:
+                    pass
             return
 
         try:
@@ -254,6 +286,79 @@ async def _passthrough_plain_tcp(reader: asyncio.StreamReader, writer: asyncio.S
                     w.close()
                 except Exception:
                     pass
+
+
+async def _connect_via_cf_worker(dst_ip: str, dst_port: int, label: str) -> Optional[RawWebSocket]:
+    """Открыть туннель до dst_ip:dst_port через Cloudflare Worker (см.
+    cf_worker/worker.js) вместо прямого TCP с самого NETH-4 -- см.
+    комментарий у CF_WORKER_HOST выше. Возвращает None, если фича не
+    настроена (пустой host/secret) или сам Worker недоступен/отказал --
+    вызывающий код в этом случае просто закрывает клиентское соединение,
+    как и раньше без этой фичи."""
+    if not CF_WORKER_HOST or not CF_WORKER_SECRET:
+        return None
+    path = f"/?dst={dst_ip}&port={dst_port}&secret={CF_WORKER_SECRET}"
+    try:
+        ws = await RawWebSocket.connect(
+            CF_WORKER_HOST, CF_WORKER_HOST, timeout=CF_WORKER_TIMEOUT, path=path)
+    except Exception as exc:
+        log.warning("[%s] Cloudflare Worker fallback к %s:%d тоже не удался: %s",
+                    label, dst_ip, dst_port, exc)
+        return None
+    log.info("[%s] прямой TCP к %s:%d не удался -- ушли через Cloudflare Worker %s",
+              label, dst_ip, dst_port, CF_WORKER_HOST)
+    return ws
+
+
+async def _relay_over_cf_worker(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                                 ws: RawWebSocket, already_read: bytes, label: str) -> None:
+    """Та же передача байт в обе стороны, что в `_passthrough_plain_tcp`,
+    только "вверх" -- не сырой TCP-сокет, а WS-туннель до Worker'а
+    (фреймы вместо голых байт, содержимое кадров не трогаем -- Worker
+    сам открывает настоящий TCP до Telegram и просто гоняет байты через
+    WebSocket, см. worker.js). Разбиение ClientHello тут не нужно: путь
+    NETH-4->Cloudflare идёт внутри TLS до самого Worker'а, а
+    Cloudflare->Telegram -- отдельный, необлачный DPI сегмент вообще не
+    видит."""
+    try:
+        await ws.send(already_read)
+    except Exception as exc:
+        log.warning("[%s] CF Worker: не удалось отправить первый чанк: %s", label, exc)
+        return
+
+    async def _up():
+        try:
+            while True:
+                chunk = await asyncio.wait_for(reader.read(65536), timeout=PASSTHROUGH_IDLE_TIMEOUT)
+                if not chunk:
+                    break
+                await ws.send(chunk)
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError,
+                OSError, asyncio.TimeoutError, ConnectionError):
+            pass
+
+    async def _down():
+        try:
+            while True:
+                chunk = await asyncio.wait_for(ws.recv(), timeout=PASSTHROUGH_IDLE_TIMEOUT)
+                if chunk is None:
+                    break
+                writer.write(chunk)
+                await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError, asyncio.TimeoutError, ConnectionError):
+            pass
+
+    # Тот же приём, что в _passthrough_plain_tcp: ждать FIRST_COMPLETED,
+    # не gather -- иначе полуоткрытая сторона держит обе задачи вечно.
+    up_task = asyncio.ensure_future(_up())
+    down_task = asyncio.ensure_future(_down())
+    try:
+        await asyncio.wait({up_task, down_task}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in (up_task, down_task):
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(up_task, down_task, return_exceptions=True)
 
 
 def _build_crypto_ctx_direct(client_dec_prekey_iv: bytes, relay_init: bytes) -> CryptoCtx:
@@ -456,12 +561,30 @@ def main():
     ap.add_argument('--port', type=int, default=8447)
     ap.add_argument('--dc-ip', action='append', default=None, metavar='DC:IP',
                      help='Переопределить быстрый путь для DC (default: 2:149.154.167.220 4:149.154.167.220)')
+    ap.add_argument('--cf-worker-host', default=None, metavar='HOST',
+                     help='Домен задеплоенного cf_worker/worker.js (например, '
+                          'zenith-tg-relay.<subdomain>.workers.dev) -- fallback для '
+                          'passthrough-трафика (web.telegram.org и т.п.), когда прямой '
+                          'TCP с этой машины заблокирован. По умолчанию берётся из '
+                          'ZTG_CF_WORKER_HOST, пусто = фича выключена.')
+    ap.add_argument('--cf-worker-secret', default=None, metavar='SECRET',
+                     help='Секрет, заданный в Worker через `wrangler secret put RELAY_SECRET` '
+                          '-- по умолчанию берётся из ZTG_CF_WORKER_SECRET.')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format='%(asctime)s  %(levelname)-5s  %(message)s')
+
+    if args.cf_worker_host:
+        global CF_WORKER_HOST
+        CF_WORKER_HOST = args.cf_worker_host
+    if args.cf_worker_secret:
+        global CF_WORKER_SECRET
+        CF_WORKER_SECRET = args.cf_worker_secret
+    if CF_WORKER_HOST and CF_WORKER_SECRET:
+        log.info("Cloudflare Worker fallback включён: %s", CF_WORKER_HOST)
 
     if args.dc_ip:
         from vendor.config import parse_dc_ip_list

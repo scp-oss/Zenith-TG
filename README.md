@@ -85,6 +85,9 @@ relay/
   vendor/                 -- вендоренная relay-машинерия tg-ws-proxy (MIT)
   tg-transparent-relay.service -- systemd unit
   setup_redirect.sh        -- iptables REDIRECT apply/remove/status
+  cf_worker/               -- опциональный fallback для passthrough
+                             (web.telegram.org и т.п.) через Cloudflare
+                             Worker -- см. cf_worker/README.md
 zapret2/
   TG_MTPROTO.block.conf   -- ЧЕРНОВИК десинк-профиля -- НЕ СРАБОТАЛ на
                              реальном IP-блэклисте (см. strategies.md),
@@ -157,15 +160,22 @@ sudo bash relay/setup_redirect.sh status   # проверить, что прав
   таймаут — несколько часов отладки ушло, пока не сравнили `curl` с
   REDIRECT и без него напрямую. Если меняете `--user`/переименовываете
   системного пользователя relay — обязательно обновите и это правило.
-- **`web.telegram.org` (браузерная версия) на NETH-4 не работает** —
-  его реальный IP (`149.154.167.99`, тот же, что у `kws2.web.telegram.org`
-  из `dc_redirects`) заблокирован так же, как исходные "боевые" IP
-  Telegram-DC, и, в отличие от MTProto-пути, эквивалента `.220` для
-  него не нашли (это не MTProto-релей с гибким выбором сервера, а
-  прямой сайт — заменить не на что). `_passthrough_plain_tcp` честно
-  пытается достучаться и получает таймаут. Приложение Telegram
-  (Desktop/mobile) при этом работает нормально — обходной путь есть
-  только для него.
+- **`web.telegram.org` (браузерная версия) на NETH-4 по умолчанию не
+  работает** — его реальный IP (`149.154.167.99`, тот же, что у
+  `kws2.web.telegram.org` из `dc_redirects`) заблокирован так же, как
+  исходные "боевые" IP Telegram-DC, и, в отличие от MTProto-пути,
+  эквивалента `.220` для него не нашли (это не MTProto-релей с гибким
+  выбором сервера, а прямой сайт — заменить не на что). Приложение
+  Telegram (Desktop/mobile) при этом работает нормально — проблема
+  затрагивает только браузерную версию.
+  Опциональный обходной путь: `_passthrough_plain_tcp` умеет уходить
+  через Cloudflare Worker (`relay/cf_worker/`, `cloudflare:sockets`),
+  если он задеплоен и настроен через `ZTG_CF_WORKER_HOST`/
+  `ZTG_CF_WORKER_SECRET` — см. `relay/cf_worker/README.md`. Не
+  гарантированное решение (зависит от связности самого Cloudflare с
+  этим IP Telegram, не проверено на реальном трафике на момент
+  написания) и требует отдельного Cloudflare-аккаунта — без настройки
+  ничего не меняется, relay ведёт себя как раньше.
 
 ## Лицензия
 
