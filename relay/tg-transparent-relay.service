@@ -1,0 +1,20 @@
+[Unit]
+Description=Transparent Telegram MTProto relay (no-secret connector, Zenith-TG)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgrelay
+Group=tgrelay
+WorkingDirectory=/opt/Zenith-TG/relay
+ExecStart=/opt/Zenith-TG/.venv/bin/python -u transparent_relay.py --host 127.0.0.1 --port 8447
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/Zenith-TG
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
