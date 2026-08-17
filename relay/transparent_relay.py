@@ -185,8 +185,39 @@ async def _passthrough_plain_tcp(reader: asyncio.StreamReader, writer: asyncio.S
             return
 
         try:
-            up_writer.write(already_read)
-            await up_writer.drain()
+            # Живой случай на NETH-4: curl честно прошёл TCP до
+            # 149.154.167.99, отправил настоящий TLS ClientHello (SNI
+            # web.telegram.org) -- и тут же обрыв, ни байта в ответ. Не
+            # IP-блокировка (голый TCP без TLS проходит) -- SNI-based
+            # DPI, тот же класс блокировки, что уже успешно обходит
+            # RKN_TLS профиль zapret2 через разбиение ClientHello на
+            # несколько TCP-сегментов (multisplit/hostfakesplit).
+            # Проблема именно в том, что мой REDIRECT (nat OUTPUT)
+            # перехватывает пакет РАНЬШЕ, чем zapret2 успевает его
+            # сманглить (mangle POSTROUTING идёт позже в netfilter для
+            # локально созданных пакетов) -- значит для TLS-трафика
+            # нужно применить ту же идею здесь самим: не слать
+            # ClientHello одним TCP-сегментом.
+            sock = up_writer.get_extra_info('socket')
+            if sock is not None:
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+
+            if already_read[:1] == b'\x16' and len(already_read) > 3:
+                # TLS handshake record -- шлём первые байты отдельными
+                # TCP-сегментами (TCP_NODELAY уже выставлен, иначе
+                # Nagle склеит их обратно в один пакет). Позиции условны
+                # (нет разбора TLS/поиска реального смещения SNI, в
+                # отличие от zapret2's pos=sniext+N) -- просто ломаем
+                # DPI, ожидающую ClientHello целиком в одном пакете.
+                for chunk in (already_read[:1], already_read[1:3], already_read[3:]):
+                    up_writer.write(chunk)
+                    await up_writer.drain()
+            else:
+                up_writer.write(already_read)
+                await up_writer.drain()
 
             async def _pipe(src, dst_w):
                 try:
