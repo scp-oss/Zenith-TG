@@ -40,6 +40,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
+import struct
 import sys
 import time
 from pathlib import Path
@@ -101,6 +103,88 @@ def _decode_direct_client_init(handshake: bytes):
     return dc_id, is_media, proto_tag, dec_prekey_and_iv
 
 
+SO_ORIGINAL_DST = 80  # linux/netfilter_ipv4.h -- получить РЕАЛЬНЫЙ адрес
+                       # назначения на сокете, перехваченном iptables
+                       # REDIRECT (ядро помнит его в conntrack)
+
+
+def _get_original_dst(writer: asyncio.StreamWriter):
+    """Реальный адрес назначения соединения ДО REDIRECT -- нужен для
+    прозрачного passthrough не-MTProto трафика (см.
+    `_passthrough_plain_tcp`). Возвращает (ip, port) или None, если
+    сокет не был перехвачен REDIRECT (например, при прямом подключении
+    к порту релея вручную для отладки)."""
+    sock = writer.get_extra_info('socket')
+    if sock is None:
+        return None
+    try:
+        raw = sock.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
+    except OSError:
+        return None
+    port, = struct.unpack('!H', raw[2:4])
+    ip = socket.inet_ntoa(raw[4:8])
+    return ip, port
+
+
+async def _passthrough_plain_tcp(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                                  already_read: bytes, label: str) -> None:
+    """Трафик, не похожий на obfuscated2 MTProto -- скорее всего
+    настоящий браузерный HTTPS (например, к web.telegram.org или любому
+    другому сайту, чей IP попал в тот же CIDR, что и MTProto-DC --
+    так и оказалось на практике: браузер до web.telegram.org ловил
+    REDIRECT и обрывался релеем, который умел разбирать только
+    MTProto). Восстанавливаем ОРИГИНАЛЬНЫЙ адрес назначения (до
+    REDIRECT, через SO_ORIGINAL_DST) и прозрачно проксируем как есть,
+    байт в байт, без какой-либо расшифровки -- реле тут просто дырка в
+    проводе для всего, что не MTProto."""
+    dst = _get_original_dst(writer)
+    if dst is None:
+        log.warning("[%s] не похоже на MTProto и не удалось узнать оригинальный "
+                    "адрес назначения -- закрываю", label)
+        return
+
+    dst_ip, dst_port = dst
+    log.info("[%s] не MTProto -- прозрачный TCP passthrough к %s:%d "
+             "(настоящий адрес назначения до REDIRECT)", label, dst_ip, dst_port)
+
+    try:
+        up_reader, up_writer = await asyncio.wait_for(
+            asyncio.open_connection(dst_ip, dst_port), timeout=8)
+    except Exception as exc:
+        log.warning("[%s] passthrough к %s:%d не удался: %s", label, dst_ip, dst_port, exc)
+        return
+
+    try:
+        up_writer.write(already_read)
+        await up_writer.drain()
+
+        async def _pipe(src, dst_w):
+            try:
+                while True:
+                    chunk = await src.read(65536)
+                    if not chunk:
+                        break
+                    dst_w.write(chunk)
+                    await dst_w.drain()
+            except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+                pass
+            finally:
+                try:
+                    dst_w.close()
+                except Exception:
+                    pass
+
+        await asyncio.gather(
+            _pipe(reader, up_writer),
+            _pipe(up_reader, writer),
+        )
+    finally:
+        try:
+            up_writer.close()
+        except Exception:
+            pass
+
+
 def _build_crypto_ctx_direct(client_dec_prekey_iv: bytes, relay_init: bytes) -> CryptoCtx:
     """То же самое, что `tg_ws_proxy.py::_build_crypto_ctx`, но без
     подмешивания секрета в ключи клиентского направления -- см.
@@ -149,8 +233,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         result = _decode_direct_client_init(handshake)
         if result is None:
             stats.connections_bad += 1
-            log.warning("[%s] не похоже на obfuscated2 MTProto (proto_tag не распознан) "
-                        "-- не Telegram-клиент или другой транспорт", label)
+            await _passthrough_plain_tcp(reader, writer, handshake, label)
             return
 
         dc, is_media, proto_tag, client_dec_prekey_iv = result
