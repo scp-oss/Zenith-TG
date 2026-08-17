@@ -11,6 +11,13 @@ WorkingDirectory=/opt/Zenith-TG/relay
 ExecStart=/opt/Zenith-TG/.venv/bin/python -u transparent_relay.py --host 127.0.0.1 --port 8447
 Restart=on-failure
 RestartSec=5
+# Прозрачный passthrough (см. transparent_relay.py::_passthrough_plain_tcp)
+# держит по 2 сокета (клиент + upstream) на КАЖДОЕ соединение, включая
+# обычный браузерный HTTPS ко всему, что попало в тот же CIDR, что и
+# Telegram (напр. web.telegram.org сам по себе открывает десятки
+# параллельных соединений) -- дефолтный лимит systemd (обычно 1024)
+# исчерпывается быстро ("Too many open files"), живой случай на NETH-4.
+LimitNOFILE=65536
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/opt/Zenith-TG

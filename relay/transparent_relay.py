@@ -166,23 +166,33 @@ async def _passthrough_plain_tcp(reader: asyncio.StreamReader, writer: asyncio.S
                         break
                     dst_w.write(chunk)
                     await dst_w.drain()
-            except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+            except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError, OSError):
                 pass
-            finally:
-                try:
-                    dst_w.close()
-                except Exception:
-                    pass
 
-        await asyncio.gather(
-            _pipe(reader, up_writer),
-            _pipe(up_reader, writer),
-        )
-    finally:
+        # asyncio.wait(FIRST_COMPLETED), не gather -- если ждать ОБЕ
+        # стороны до конца, полуоткрытое соединение (одна сторона молча
+        # перестала слать данные, не закрывая TCP) держит оба сокета
+        # открытыми НАВСЕГДА. Как только закрылась любая сторона --
+        # рвём вторую сами, не дожидаясь. Живой случай на NETH-4:
+        # web.telegram.org открывает десятки параллельных соединений,
+        # без этого они копились и упирались в лимит дескрипторов
+        # ("Too many open files").
+        up_task = asyncio.ensure_future(_pipe(reader, up_writer))
+        down_task = asyncio.ensure_future(_pipe(up_reader, writer))
         try:
-            up_writer.close()
-        except Exception:
-            pass
+            await asyncio.wait(
+                {up_task, down_task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (up_task, down_task):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(up_task, down_task, return_exceptions=True)
+    finally:
+        for w in (up_writer, writer):
+            try:
+                w.close()
+            except Exception:
+                pass
 
 
 def _build_crypto_ctx_direct(client_dec_prekey_iv: bytes, relay_init: bytes) -> CryptoCtx:
