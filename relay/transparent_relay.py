@@ -554,13 +554,31 @@ async def main_async(host: str, port: int, dc_ip: Dict[int, str]) -> None:
         await server.serve_forever()
 
 
+# Живой случай на NETH-4, 2026-08-22: только DC 2/4 имели прямой быстрый
+# путь по умолчанию -- любой другой DC (клиент попадает на DC по номеру
+# СВОЕГО аккаунта при регистрации, не зависит от платформы/устройства)
+# проваливался в do_fallback -> CF proxy fallback -> все 20 доменов из
+# Flowseal/tg-ws-proxy (vendor/config.py) резолвились в
+# "No address associated with hostname" (gaierror -5, домены есть в DNS,
+# но без A/AAAA -- сами домены умерли у апстрима, не наша DNS-проблема).
+# Наблюдалось как "на iPhone работает, на Android нет" -- совпадение: у
+# конкретных Android-аккаунтов DC оказался не 2/4. 149.154.167.220 --
+# это официальный WebSocket-шлюз Telegram, ОДИН И ТОТ ЖЕ IP для любого
+# DC (разница только в Host-домене, см. ws_domains() в vendor/utils.py),
+# так что расширение на все 5 настоящих DC ничего не удорожает и убирает
+# саму нужду в fallback для любого нормального (не "мусорного" test-DC,
+# см. декодер в _decode_direct_client_init) соединения.
+DEFAULT_DC_IP = {dc: '149.154.167.220' for dc in (1, 2, 3, 4, 5)}
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--host', default='127.0.0.1', help='Слушать здесь (default 127.0.0.1 -- см. предупреждение в докстринге)')
     ap.add_argument('--port', type=int, default=8447)
     ap.add_argument('--dc-ip', action='append', default=None, metavar='DC:IP',
-                     help='Переопределить быстрый путь для DC (default: 2:149.154.167.220 4:149.154.167.220)')
+                     help='Переопределить быстрый путь для DC (default: все 5 DC через '
+                          '149.154.167.220 -- см. комментарий у DEFAULT_DC_IP)')
     ap.add_argument('--cf-worker-host', default=None, metavar='HOST',
                      help='Домен задеплоенного cf_worker/worker.js (например, '
                           'zenith-tg-relay.<subdomain>.workers.dev) -- fallback для '
@@ -590,7 +608,7 @@ def main():
         from vendor.config import parse_dc_ip_list
         dc_ip = parse_dc_ip_list(args.dc_ip)
     else:
-        dc_ip = {2: '149.154.167.220', 4: '149.154.167.220'}
+        dc_ip = dict(DEFAULT_DC_IP)
 
     try:
         asyncio.run(main_async(args.host, args.port, dc_ip))

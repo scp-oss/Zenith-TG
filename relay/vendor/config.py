@@ -64,7 +64,9 @@ class ProxyConfig:
     port: int = 1443
     host: str = '127.0.0.1'
     secret: str = field(default_factory=lambda: os.urandom(16).hex())
-    dc_redirects: Dict[int, str] = field(default_factory=lambda: {2: '149.154.167.220', 4: '149.154.167.220'})
+    # См. DEFAULT_DC_IP в relay/transparent_relay.py -- один и тот же
+    # WebSocket-шлюз для всех 5 настоящих DC, не только 2/4.
+    dc_redirects: Dict[int, str] = field(default_factory=lambda: {dc: '149.154.167.220' for dc in (1, 2, 3, 4, 5)})
     buffer_size: int = 256 * 1024
     pool_size: int = 4
     fallback_cfproxy: bool = True
