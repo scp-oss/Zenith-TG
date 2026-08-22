@@ -153,6 +153,38 @@ revisiting if `mtproxy_relay.py` turns out not to be a full fix.
   pivot below, but relevant if `mtproxy_relay.py` doesn't fully resolve
   it either.
 
+### Also ruled out (checked directly on NETH-4, both clean)
+
+- **IPv6 bypassing REDIRECT entirely.** `setup_redirect.sh` only ever
+  touches `iptables` (IPv4) — `cidr/fetch_telegram_cidr.sh` fetches an
+  IPv6 list too but nothing applies it (`ip6tables`), and neither relay
+  listens on an IPv6 address. Real concern: if Android's real MTProto
+  attempt went out over IPv6, it would never reach either relay and we'd
+  never see it. Checked: `ip -6 route show default` is **empty** and
+  `curl -6` to a known-good global IPv6 address fails immediately
+  ("Сеть недоступна" / network unreachable) — NETH-4's only IPv6 address
+  is a ULA (`fd3f:...`, RFC4193, not internet-routable, likely
+  auto-assigned by the home router). No real IPv6 path exists at all, in
+  or out — this can't be the gap, on either side.
+- **Stale/incomplete Telegram CIDR list.** `cidr/telegram_ipv4.txt`
+  (cached 2026-08-17) covers `149.154.160.0/20`, which includes every
+  single destination IP observed in the TLS-shaped captures (`.51`,
+  `.41`, `.99`, `.167.222`, `.170.200`, `.174.200`, `.175.54` — all fall
+  in `160.0–175.255`). REDIRECT is not missing these destinations; they
+  were always being caught and delivered to the relay correctly, which
+  is exactly what the logs already showed. (Side finding, unrelated:
+  re-running `fetch_telegram_cidr.sh` to check for a fresher upstream
+  list failed outright — `core.telegram.org` itself doesn't respond over
+  TLS from NETH-4 right now. Not investigated further, the cached list
+  was already sufficient for this question.)
+
+Both of these were real, testable hypotheses about the iptables/REDIRECT
+layer specifically (the user's explicit suggestion for where to look
+next) — both came back clean. The gap is not in what gets captured or
+delivered to `transparent_relay.py`; it's that Android's real client
+genuinely sends TLS instead of obfuscated2 over this network path, for a
+reason still not identified.
+
 ### Path taken: `mtproxy_relay.py` (explicit MTProxy, not more reverse-engineering)
 
 The user supplied the key piece of context that ended the guessing: **the
