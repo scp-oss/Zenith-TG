@@ -431,6 +431,12 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         result = _decode_direct_client_init(handshake)
         if result is None:
             stats.connections_bad += 1
+            # Временная диагностика (см. --verbose) -- живой разбор
+            # "почему конкретный клиент никогда не распознаётся как
+            # MTProto": первые 16 байт достаточно, чтобы отличить
+            # реальный TLS ClientHello (0x16 0x03...) от чего-то ещё,
+            # не раскрывая весь хендшейк в лог.
+            log.debug("[%s] non-MTProto handshake head: %s", label, handshake[:16].hex())
             await _passthrough_plain_tcp(reader, writer, handshake, label)
             return
 
