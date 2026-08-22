@@ -113,20 +113,57 @@ addresses (`149.154.167.99`, `149.154.170.200`, `149.154.174.200`,
 (since `_decode_direct_client_init()` correctly refuses to touch real
 TLS), timed out / failed to connect.
 
-**Correction, checked directly with a bare `curl` from NETH-4 bypassing
-the relay entirely** (`curl -v --connect-timeout 4 https://<ip>:443/`
-for `.51`/`.41`/`.222`/`175.54`): these are **NOT** SYN-null-routed like
-`149.154.167.99`/web.telegram.org already documented in the README. TCP
-connects fine, ClientHello goes out (curl logs `TLS handshake, Client
-hello (1)`), then it silently times out waiting for a ServerHello — no
-RST, no response. That's a DPI blackhole triggered by inspecting the
-handshake itself, not an IP-level block — in principle the same class of
-thing `--lua-desync=` (ClientHello fragmentation) already defeats
-elsewhere in this project, unlike the earlier, different `.99` case.
-Whether that's actually exploitable here (the traffic in question is
-Android's own outbound, not something z2r_autobench's zapret2 currently
-targets) wasn't pursued further before the pivot below — worth
-revisiting if `mtproxy_relay.py` turns out not to be a full fix.
+**Correction (this whole paragraph originally said something wrong —
+kept below with the fix so the mistake and the reason it was wrong are
+both on record):** a `curl -v --connect-timeout 4 https://<ip>:443/`
+for `.51`/`.41`/`.222`/`175.54`, run as **root**, appeared to show TCP
+connecting and a real ClientHello going out before silently timing out —
+read at the time as a DPI blackhole *after* the handshake starts, not a
+SYN-level block like the already-documented `.99` case. **That test was
+invalid.** `iptables -t nat OUTPUT` REDIRECTs *any* locally-originated
+connection to Telegram's CIDR to the relay's own port — the self-loop
+exclusion (`c173450`, see below) only exempts traffic from the `tgrelay`
+user. `curl` run as root has no such exemption, so it was hitting the
+relay's own listening socket on NETH-4, not the real internet — the
+"ClientHello sent, then silence" was really the relay receiving curl's
+ClientHello locally, correctly classifying it as non-MTProto, and its
+*own* (correctly `tgrelay`-exempted) passthrough re-connect attempt
+timing out in the background while curl sat on its side of the loop
+waiting.
+
+**Redone correctly** (`sudo -u tgrelay curl -sv --connect-timeout 4
+https://149.154.167.51:443/`, genuinely bypassing REDIRECT this time):
+plain `Connection timed out` at the TCP layer — no ClientHello is even
+reached. This **is** the same SYN-null-route class as `149.154.167.99`/
+web.telegram.org, just confirmed now for a wider set of "well-known"
+default DC IPs too — matches this project's own earlier finding, from
+before this relay existed, that the block is "a curated IP blacklist of
+specific well-known Telegram DC addresses," not a DPI signature. The
+`--lua-desync=`/ClientHello-fragmentation idea floated earlier for
+`transparent_relay.py`'s passthrough path was therefore never viable —
+correctly abandoned, just for the right reason now instead of the wrong
+one.
+
+One real puzzle this surfaces: `149.154.167.220` (the WS-bridge gateway
+`mtproxy_relay.py`'s confirmed-working sessions actually connect to) is
+in the *same* `149.154.160.0/20` block, yet is reachable — the blacklist
+is evidently curated by specific IP, not by the whole announced CIDR
+range, and `.220` (obscure, only meaningful to tg-ws-proxy-style relays,
+not something an ordinary direct client would ever try on its own)
+simply never made that list. Doesn't change what happens to be reachable
+from NETH-4 for MTProto (via `mtproxy_relay.py`'s WS-bridge path, always
+fine) — but it does mean `transparent_relay.py`'s plain-TCP passthrough
+for "not MTProto" traffic is structurally dead for most of Telegram's
+real IP space, not just `.99`, independent of any DPI trickery.
+
+**Important: none of this touches why Android sends TLS instead of
+obfuscated2 in the first place.** REDIRECT rewrites the destination in
+netfilter before a packet ever leaves NETH-4, so whether that
+destination would ultimately have been reachable is irrelevant to what
+bytes the relay actually receives from the client — the format mystery
+is unaffected by this finding either way. Recorded here purely to fix
+the earlier wrong conclusion and stop it from misleading a future
+session, not because it resolves the open question.
 
 ### What this means, and what's still open
 
@@ -184,6 +221,23 @@ next) — both came back clean. The gap is not in what gets captured or
 delivered to `transparent_relay.py`; it's that Android's real client
 genuinely sends TLS instead of obfuscated2 over this network path, for a
 reason still not identified.
+
+**Also checked (user's memory, correctly recalled): did the earlier
+"get web.telegram.org working" commit chain (`ea1ec87` →
+`37cbe19` → `0410f48` → `51b5cd7` → `c173450` → `3dd56ae`, all from
+2026-08-17, before this repo's history was made a shallow clone — needed
+`git fetch --unshallow` to see them) introduce a regression that broke
+Android specifically, only caught for iPhone at the time?** Read every
+diff in that chain: none of them ever touch `_decode_direct_client_init()`
+(the MTProto/TLS classification function itself) — they only add/refine
+what happens *after* that function already says "not MTProto"
+(passthrough, its concurrency cap, CF-Worker fallback). The detection
+logic is identical from the very first commit (`9625513`) to today. So
+this specific chain is not where a decoder regression could hide — ruled
+out as the mechanism, though see the SYN-block correction above, which
+*was* found by re-reading `c173450` (the self-loop fix in that same
+chain) and is a real, useful outcome of chasing this lead even though
+the regression theory itself didn't pan out.
 
 ### Path taken: `mtproxy_relay.py` (explicit MTProxy, not more reverse-engineering)
 
