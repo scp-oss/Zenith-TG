@@ -112,6 +112,12 @@ CF_WORKER_SECRET = os.environ.get('ZTG_CF_WORKER_SECRET', '')
 CF_WORKER_TIMEOUT = 8.0
 
 
+# Единственные DC, которые реально существуют у Telegram -- 1-5, плюс
+# те же номера +10000 для тестовой среды (см. is_test_dc в
+# _handle_client). Всё остальное НЕ может быть настоящим клиентом.
+_REAL_DC_IDS = frozenset(range(1, 6)) | frozenset(range(10001, 10006))
+
+
 def _decode_direct_client_init(handshake: bytes):
     """Декодирует 64-байтный init КАК НАСТОЯЩИЙ прямой клиент -- ключ
     сырой (без SHA256+secret), позиции те же, что у
@@ -119,7 +125,21 @@ def _decode_direct_client_init(handshake: bytes):
     оригиналом при разборе -- см. докстринг файла). Возвращает
     (dc_id, is_media, proto_tag, client_dec_prekey_iv) или None, если
     пакет не похож на валидный obfuscated2 init (proto_tag не
-    распознан) -- НЕ "неверный секрет", секрета тут нет в принципе."""
+    распознан, ИЛИ тег распознан, но dc_id вне реального диапазона
+    Telegram -- см. _REAL_DC_IDS) -- НЕ "неверный секрет", секрета тут
+    нет в принципе.
+
+    Живой случай на NETH-4, 2026-08-22: без проверки dc_id детектор
+    массово ловил ложные срабатывания -- 4-байтовый proto_tag это всего
+    32 бита, и на достаточном потоке НЕ-MTProto TCP-трафика (тот же
+    CIDR, что и у Telegram DC, попадает под REDIRECT) периодически
+    случайно совпадает с одним из 3 известных тегов после AES-CTR по
+    ПРОИЗВОЛЬНОМУ ключу из первых байт пакета -- сам факт совпадения
+    тега НЕ гарантирует, что это настоящий MTProto. Наблюдалось
+    массово именно на Android (десятки "прямой клиент: DC16712" и
+    подобных абсурдных номеров за секунды после переоткрытия
+    приложения) -- отсюда и путалось с "не работает на Android", хотя
+    настоящая проблема тут, в самом детекторе, а не в устройстве."""
     dec_prekey_and_iv = handshake[SKIP_LEN:SKIP_LEN + PREKEY_LEN + IV_LEN]
     dec_key = dec_prekey_and_iv[:PREKEY_LEN]
     dec_iv = dec_prekey_and_iv[PREKEY_LEN:]
@@ -133,6 +153,8 @@ def _decode_direct_client_init(handshake: bytes):
 
     dc_idx = int.from_bytes(decrypted[DC_IDX_POS:DC_IDX_POS + 2], 'little', signed=True)
     dc_id = abs(dc_idx)
+    if dc_id not in _REAL_DC_IDS:
+        return None
     is_media = dc_idx < 0
     return dc_id, is_media, proto_tag, dec_prekey_and_iv
 
