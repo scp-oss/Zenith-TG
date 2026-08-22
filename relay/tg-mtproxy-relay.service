@@ -1,0 +1,32 @@
+[Unit]
+Description=Telegram MTProxy relay (secret-based, explicit client config, Zenith-TG)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgrelay
+Group=tgrelay
+WorkingDirectory=/opt/Zenith-TG/relay
+# ОБЯЗАТЕЛЬНЫЙ файл (без ведущего "-" -- сервис не должен молча стартовать
+# без секрета: без фиксации ZTG_MTPROXY_SECRET тут при каждом рестарте
+# сгенерировался бы новый случайный секрет, обрывая всех уже настроенных
+# клиентов). Сгенерировать один раз:
+#   python3 -c "import os; print(os.urandom(16).hex())"
+# Формат файла (те же две строки, KEY=VALUE):
+#   ZTG_MTPROXY_SECRET=<32 hex-символа>
+#   ZTG_MTPROXY_PORT=9443
+# Порт должен быть свободен -- не занят x-ui/панелью/чем-то ещё на этой
+# машине, проверь `ss -tlnp` перед первым запуском.
+EnvironmentFile=/etc/z2r_autobench/tgrelay.env
+ExecStart=/opt/Zenith-TG/.venv/bin/python -u mtproxy_relay.py --host 0.0.0.0 --port ${ZTG_MTPROXY_PORT} --secret ${ZTG_MTPROXY_SECRET}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/Zenith-TG
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

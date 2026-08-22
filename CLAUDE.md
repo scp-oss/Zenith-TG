@@ -7,7 +7,12 @@ project names here — same public-repo constraint as README.md (NETH-4 is
 an internal codename already used throughout this engagement, not a real
 hostname — same convention as z2r_autobench's own CLAUDE.md).
 
-## Android MTProto investigation (started 2026-08-22, UNRESOLVED)
+## Android MTProto investigation (started 2026-08-22)
+
+**Status: mitigated via `mtproxy_relay.py`, root cause of `transparent_relay.py`'s
+Android failure still UNRESOLVED.** See "Path taken" at the end of this
+section for what was actually shipped. Everything below this line is the
+original investigation trail, kept intact for context.
 
 **Symptom:** `relay/transparent_relay.py` (transparent, no-secret MTProto
 relay) works fine on iPhone, but Telegram never gets past "Connecting..."
@@ -84,11 +89,22 @@ addresses (`149.154.167.99`, `149.154.170.200`, `149.154.174.200`,
 `149.154.167.51`, `149.154.167.41`, `149.154.167.222`, `149.154.175.54`)
 — and every one of them, once passed through as plain TCP passthrough
 (since `_decode_direct_client_init()` correctly refuses to touch real
-TLS), timed out / failed to connect. This matches the *already
-documented* README finding (`149.154.167.99` / web.telegram.org
-null-routed at the SYN level, not SNI-based — no `--lua-desync=` split
-can help because the packet never leaves in the first place) — just now
-observed across a much wider set of DC IPs than just that one.
+TLS), timed out / failed to connect.
+
+**Correction, checked directly with a bare `curl` from NETH-4 bypassing
+the relay entirely** (`curl -v --connect-timeout 4 https://<ip>:443/`
+for `.51`/`.41`/`.222`/`175.54`): these are **NOT** SYN-null-routed like
+`149.154.167.99`/web.telegram.org already documented in the README. TCP
+connects fine, ClientHello goes out (curl logs `TLS handshake, Client
+hello (1)`), then it silently times out waiting for a ServerHello — no
+RST, no response. That's a DPI blackhole triggered by inspecting the
+handshake itself, not an IP-level block — in principle the same class of
+thing `--lua-desync=` (ClientHello fragmentation) already defeats
+elsewhere in this project, unlike the earlier, different `.99` case.
+Whether that's actually exploitable here (the traffic in question is
+Android's own outbound, not something z2r_autobench's zapret2 currently
+targets) wasn't pursued further before the pivot below — worth
+revisiting if `mtproxy_relay.py` turns out not to be a full fix.
 
 ### What this means, and what's still open
 
@@ -104,35 +120,50 @@ observed across a much wider set of DC IPs than just that one.
   separate from both plain obfuscated2 and manually-configured Fake-TLS.
   If true, decoding/relaying it would require reverse-engineering
   whatever scheme that transport actually uses — not yet attempted.
-- **Not yet confirmed either way:** whether genuine obfuscated2 traffic
-  (random-looking 64 bytes, NOT starting with `16 03`) EVER shows up
-  from Android at all. The captures so far were all taken in the first
-  few seconds right after force-reopening the app, which floods with
-  this TLS-shaped connection burst — that burst may just be Telegram's
-  own aggressive multi-DC/config-fetch probing on startup, and the real
-  chat session might establish via a different, not-yet-observed
-  connection once the burst settles. **This is the next concrete thing
-  to check**: capture a *quiet* window (a minute or two after opening
-  the app, not immediately after) and look specifically for
-  `прямой клиент: DC` log lines with a real DC number (1-5) and what
-  happens after (`pool hit` vs `no fallback`).
-- Also not yet checked: does Telegram actually send/receive messages
-  despite the perpetual "Connecting..." UI state, or is it fully stuck?
-  If messages DO flow, the "Connecting..." indicator itself may be
-  reacting to this failing TLS-shaped side-channel (e.g. a config/stats
-  endpoint), not the core session — very different bug than a fully dead
-  session.
-- If the TLS-shaped traffic turns out to be unavoidable and the DC IPs
-  keep being SYN-null-routed regardless of protocol wrapping, the
-  eventual fix path is likely NOT more Python relay logic — it's
-  z2r_autobench's own zapret2 desync layer (already handles TLS-shaped
-  DPI evasion for everything else in this whole project), *if* it can
-  even reach these packets before the null-route triggers. Genuinely a
-  SYN-level black hole (confirmed via bare `curl` in earlier work, see
-  README) can't be desync'd around — there's nothing to manipulate,
-  the packet is simply never allowed out. Worth re-confirming whether
-  that's still true for the wider DC IP set observed here, not just
-  `149.154.167.99`.
+- **CONFIRMED, not just the startup burst:** checked a settled window (app
+  left open ~90s, not immediately after reopening) and the *steady-state*
+  traffic was still 100% TLS-shaped, zero `прямой клиент` hits, ever.
+  Android does not send obfuscated2 to this relay at any point observed —
+  not just during the initial multi-DC probe burst. Rules out "wait for
+  the burst to settle" as an explanation.
+- Still not checked: does Telegram actually send/receive messages despite
+  the perpetual "Connecting..." UI state. Moot for the moment given the
+  pivot below, but relevant if `mtproxy_relay.py` doesn't fully resolve
+  it either.
+
+### Path taken: `mtproxy_relay.py` (explicit MTProxy, not more reverse-engineering)
+
+The user supplied the key piece of context that ended the guessing: **the
+original upstream project, unmodified, with the standard secret-based
+MTProxy protocol and a client explicitly configured via a `tg://proxy?...`
+link, already worked correctly on both iPhone and Android before this
+project adapted it into the transparent no-secret connector.** The
+transparent mode was a usability nice-to-have (no client config needed),
+not a requirement — and it's the thing that broke on Android, not the
+underlying relay machinery.
+
+Rather than continuing to reverse-engineer whatever TLS-shaped transport
+unconfigured Android is actually using, added `relay/mtproxy_relay.py` +
+vendored `relay/vendor/tg_ws_proxy.py` (the ORIGINAL upstream entry point,
+completely unmodified — just imported as a module, same MIT vendoring
+convention as the rest of `vendor/`) as a second, independent service.
+Runs the real secret-based protocol on a public port; `transparent_relay.py`
+is untouched and keeps running for iPhone (or anything else the no-secret
+path works for). See README.md "Альтернатива: mtproxy_relay.py" for setup,
+`tg-mtproxy-relay.service` for the systemd unit (requires
+`ZTG_MTPROXY_SECRET`/`ZTG_MTPROXY_PORT` in `/etc/z2r_autobench/tgrelay.env`
+— generate the secret once with `python3 -c "import os; print(os.urandom(16).hex())"`,
+never let the service auto-generate one on every restart or every
+configured client breaks).
+
+**Not yet done on NETH-4 as of this writing:** actually deploying this
+(picking a free port, generating+fixing the secret, installing the
+systemd unit, generating the `tg://proxy?...` link/QR and configuring it
+on the Android devices, end-to-end verification that Telegram actually
+connects through it). That's the immediate next step for whoever picks
+this up. Root cause of *why* `transparent_relay.py` fails on Android is
+still open (see above) — this is a working mitigation, not a fix for the
+transparent mode itself.
 
 ### How to reproduce the diagnostic capture
 
