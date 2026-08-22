@@ -9,10 +9,32 @@ hostname — same convention as z2r_autobench's own CLAUDE.md).
 
 ## Android MTProto investigation (started 2026-08-22)
 
-**Status: mitigated via `mtproxy_relay.py`, root cause of `transparent_relay.py`'s
-Android failure still UNRESOLVED.** See "Path taken" at the end of this
-section for what was actually shipped. Everything below this line is the
-original investigation trail, kept intact for context.
+**Status: mitigated via `mtproxy_relay.py`, deployed and confirmed working
+on NETH-4** — real MTProto sessions on multiple DCs (DC1/DC2/DC2m/DC4m/
+DC203) closing normally with substantial two-way data (one session moved
+1.2MB down), verified live in `journalctl -u tg-mtproxy-relay`. Root
+cause of *why* `transparent_relay.py`'s no-secret path fails on Android
+is still UNRESOLVED (see the trail below, kept intact for context).
+
+**One open caveat, NOT independently verified:** all confirmed-working
+sessions were captured with the Android device on the same home Wi-Fi as
+NETH-4 (source IP `192.168.0.24`, a LAN peer address — NOT `192.168.0.40`,
+which is what NETH-4's own tunnel-terminated traffic shows elsewhere in
+this doc). `tg://proxy?server=192.168.0.40&...` points at a **private**
+RFC1918 address, unreachable from outside that LAN by definition. Whether
+Happ (the Android VLESS client) actually tunnels traffic to a private
+destination IP through VLESS, or has a hardcoded "bypass VPN for LAN
+addresses" default (common in VPN clients, separate from the app's own
+user-facing "routing" toggle which is currently OFF) determines whether
+this same link keeps working once the phone leaves that Wi-Fi network —
+untested; the user judged it likely fine given their client is in
+full-tunnel mode, but flagged and not proven. **If it turns out NOT to
+work away from home:** the fix is port-forwarding `9443` on the home
+router (Keenetic) to NETH-4 and pointing the `tg://proxy` link's `server=`
+at the router's public IP/DDNS instead of `192.168.0.40` — same principle
+already used for whatever address the VLESS inbound itself is reachable
+on from outside. Not done as of this writing; only prepare it if the
+cross-network case actually fails in practice.
 
 **Symptom:** `relay/transparent_relay.py` (transparent, no-secret MTProto
 relay) works fine on iPhone, but Telegram never gets past "Connecting..."
@@ -156,14 +178,15 @@ path works for). See README.md "Альтернатива: mtproxy_relay.py" for 
 never let the service auto-generate one on every restart or every
 configured client breaks).
 
-**Not yet done on NETH-4 as of this writing:** actually deploying this
-(picking a free port, generating+fixing the secret, installing the
-systemd unit, generating the `tg://proxy?...` link/QR and configuring it
-on the Android devices, end-to-end verification that Telegram actually
-connects through it). That's the immediate next step for whoever picks
-this up. Root cause of *why* `transparent_relay.py` fails on Android is
-still open (see above) — this is a working mitigation, not a fix for the
-transparent mode itself.
+**Deployed and verified on NETH-4** (2026-08-22): port `9443`, secret
+fixed via `ZTG_MTPROXY_SECRET`/`ZTG_MTPROXY_PORT` in
+`/etc/z2r_autobench/tgrelay.env`, `tg-mtproxy-relay.service` enabled.
+Link configured on the Android device, real MTProto traffic confirmed
+flowing (see status note at the top of this section for the one
+remaining unverified caveat — cross-network reachability of the
+currently-advertised private LAN address). Root cause of *why*
+`transparent_relay.py` fails on Android is still open (see above) — this
+is a working mitigation, not a fix for the transparent mode itself.
 
 ### How to reproduce the diagnostic capture
 
